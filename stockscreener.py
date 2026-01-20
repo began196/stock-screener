@@ -32,6 +32,7 @@ import argparse
 
 import numpy as np
 import pandas as pd
+import polars as pl
 import requests
 import yfinance as yf
 import datetime
@@ -59,8 +60,6 @@ class SignalParams:
     margin_of_safety: float = 0.30
     sell_buffer: float = 0.15
 
-# For quick debugging: set to e.g. 30, then None when ready
-MAX_TICKERS = None
 
 # Define helper functions
 
@@ -75,13 +74,8 @@ def safe_get(d: Dict, key: str) -> Optional[float]:
     except Exception:
         return None
 
-def to_billions(x: Optional[float]) -> Optional[float]:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return None
-    return x / 1e9
-
 # Fetch SnP500 tickers
-def fetch_sp500_tickers() -> pd.DataFrame:
+def fetch_sp500_tickers() -> pl.DataFrame:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -98,10 +92,13 @@ def fetch_sp500_tickers() -> pd.DataFrame:
     sp500.rename(columns={"Symbol": "Ticker"}, inplace=True)
     sp500["Ticker"] = sp500["Ticker"].str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
 
-    return sp500
+    return pl.from_pandas(sp500).with_columns([
+        pl.lit("United States").alias("Country"),
+        pl.lit("US").alias("Region"),
+    ])
 
 # Fetch STOXX Europe 600 tickers
-def read_ishares_holdings_csv(text: str) -> pd.DataFrame:
+def read_ishares_holdings_csv(text: str) -> pl.DataFrame:
     lines = text.splitlines()
 
     # 1) Find the header row (where the actual table begins)
@@ -129,11 +126,9 @@ def read_ishares_holdings_csv(text: str) -> pd.DataFrame:
         engine="python",       # more forgiving for odd quoting
     )
 
-    # Clean column names (sometimes extra whitespace)
-    df.columns = [c.strip() for c in df.columns]
     return df
 
-def fetch_stoxx600_from_ishares() -> pd.DataFrame:
+def fetch_stoxx600_from_ishares() -> pl.DataFrame:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -157,21 +152,46 @@ def fetch_stoxx600_from_ishares() -> pd.DataFrame:
         "Ticker": df["Ticker"].astype(str).str.strip(),
         "Security": df["Name"].astype(str).str.strip(),
         "GICS Sector": df["Sector"].astype(str).str.strip(),
+        "GICS Sub-Industry": None,
         "Country": df["Location"].astype(str).str.strip(),
+        "Exchange": df["Exchange"].astype(str).str.strip(),
         "Region": "Europe"
     })
 
     out = out[out["Ticker"].notna() & (out["Ticker"] != "")]
     out = out.drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
+    out["Ticker"] = out["Ticker"].str.replace(".", "", regex=False)
+    out["Ticker"] = out["Ticker"].str.replace(" ", "-", regex=False)
+
+    out = pl.from_pandas(out)
+
+    # Append exchange suffix
+    exchange_suffix = {
+        "Euronext Amsterdam": "AS",
+        "SIX Swiss Exchange": "SW",
+        "London Stock Exchange": "L",
+        "Omx Nordic Exchange Copenhagen A/S": "CO",
+        "Bolsa De Madrid": "MC",
+        "Nyse Euronext - Euronext Paris": "PA",
+        "Borsa Italiana": "MI",
+        "Nyse Euronext - Euronext Brussels": "BE",
+        "Nasdaq Omx Helsinki Ltd.": "HE",
+        "Xetra": "DE"
+    }
+    out = out.with_columns(
+        pl.when(pl.col("Exchange").is_in(exchange_suffix.keys()))
+        .then(
+            pl.col("Ticker") + "." + pl.col("Exchange").replace(exchange_suffix)
+        )
+        .otherwise(pl.col("Ticker"))
+        .alias("Ticker")
+    )
+
     return out
 
 # Discounted cash flow and peer multiple valuation functions
 def dcf_lite_equity_value_per_share(
-    fcf: float,
-    shares_out: float,
-    net_debt: float,
-    params: DCFParams,
-    growth: float,
+    fcf: float, shares_out: float, net_debt: float, params: DCFParams, growth: float,
 ) -> Optional[float]:
     if fcf <= 0 or shares_out <= 0:
         return None
@@ -196,10 +216,7 @@ def dcf_lite_equity_value_per_share(
 
 # Calculate Peer fair value
 def peer_multiple_fair_value_per_share(
-    peer_ev_to_ebitda_median: float,
-    ebitda: float,
-    shares_out: float,
-    net_debt: float,
+    peer_ev_to_ebitda_median: float, ebitda: float, shares_out: float, net_debt: float,
 ) -> Optional[float]:
     if peer_ev_to_ebitda_median <= 0 or ebitda <= 0 or shares_out <= 0:
         return None
@@ -296,147 +313,172 @@ def compute_quality_metrics(info: Dict, ticker_obj: yf.Ticker) -> Dict[str, Opti
     return out
 
 # Pull market snapshot
-def build_universe_snapshot(tickers: List[str]) -> pd.DataFrame:
+def build_universe_snapshot(tickers: List[str]) -> pl.DataFrame:
     rows = []
 
     for i, t in enumerate(tickers, 1):
         try:
             tk = yf.Ticker(t)
             info = tk.get_info()
-
-            price = safe_get(info, "currentPrice") or safe_get(info, "regularMarketPrice")
-            market_cap = safe_get(info, "marketCap")
-            enterprise_value = safe_get(info, "enterpriseValue")
-            ev_to_ebitda = safe_get(info, "enterpriseToEbitda")
-            sector = safe_get(info, "sector")
-
             q = compute_quality_metrics(info, tk)
 
-            rows.append(
-                {
-                    "ticker": t,
-                    "sector": sector,
-                    "price": price,
-                    "market_cap": market_cap,
-                    "enterprise_value": enterprise_value,
-                    "ev_to_ebitda": ev_to_ebitda,
-                    **q,
-                }
-            )
+            row = {
+                "ticker": t,
+                "price": safe_get(info, "currentPrice"),
+                "market_cap": safe_get(info, "marketCap"),
+                "enterprise_value": safe_get(info, "enterpriseValue"),
+                "ev_to_ebitda": safe_get(info, "enterpriseToEbitda"),
+                "fcf": safe_get(info, "freeCashflow"),
+                "ebitda": safe_get(info, "ebitda"),
+                "shares_out": safe_get(info, "sharesOutstanding"),
+                **q
+            }
+
+            td, tc = safe_get(info, "totalDebt"), safe_get(info, "totalCash")
+            row["net_debt"] = td - tc if td and tc else td
+
+            rows.append(row)
         except Exception as e:
             rows.append({"ticker": t, "error": str(e)})
 
         if i % 50 == 0:
             print(f"Fetched {i}/{len(tickers)} tickers...")
 
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
-# Quality screening of stocks
-def apply_quality_screen(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
+# Quality screening 
+def apply_quality_screen(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df.with_columns([
+            # Positive cash generation / operating viability
+            (pl.col("fcf").fill_null(-1) > 0).alias("qc_fcf_pos"),
+            (pl.col("ebitda").fill_null(-1) > 0).alias("qc_ebitda_pos"),
 
-    d["qc_fcf_pos"] = d["fcf"].fillna(-1) > 0
-    d["qc_ebitda_pos"] = d["ebitda"].fillna(-1) > 0
+            # Leverage: allow nulls (unknown) to pass, but fail if clearly too levered
+            (pl.col("net_debt_to_ebitda").is_null() | (pl.col("net_debt_to_ebitda") <= 3.0)).alias("qc_leverage_ok"),
 
-    nde = d["net_debt_to_ebitda"]
-    d["qc_leverage_ok"] = nde.isna() | (nde <= 3.0)
+            # Debt service: allow nulls to pass
+            (pl.col("interest_coverage").is_null() | (pl.col("interest_coverage") >= 3.0)).alias("qc_intcov_ok"),
 
-    ic = d["interest_coverage"]
-    d["qc_intcov_ok"] = ic.isna() | (ic >= 3.0)
-
-    roic = d["roic_proxy"]
-    d["qc_roic_ok"] = roic.isna() | (roic >= 0.08)
-
-    d["quality_pass"] = (
-        d["qc_fcf_pos"] &
-        d["qc_ebitda_pos"] &
-        d["qc_leverage_ok"] &
-        d["qc_intcov_ok"] &
-        d["qc_roic_ok"]
+            # ROIC proxy: allow nulls to pass
+            (pl.col("roic_proxy").is_null() | (pl.col("roic_proxy") >= 0.08)).alias("qc_roic_ok"),
+        ])
+        .with_columns([
+            (
+                pl.col("qc_fcf_pos")
+                & pl.col("qc_ebitda_pos")
+                & pl.col("qc_leverage_ok")
+                & pl.col("qc_intcov_ok")
+                & pl.col("qc_roic_ok")
+            ).alias("quality_pass")
+        ])
     )
 
-    return d
 
-# Compute intrinsic value of the companies and generate trading singals
+# Compute intrinsic values + signals
 def compute_intrinsic_and_signals(
-    df: pd.DataFrame,
+    df: pl.DataFrame,
     dcf_params: DCFParams,
     sig_params: SignalParams,
-) -> pd.DataFrame:
-    d = df.copy()
+) -> pl.DataFrame:
+    d = df.clone()
 
-    # Peer EV/EBITDA median across the universe
-    peer_pool = d["ev_to_ebitda"].replace([np.inf, -np.inf], np.nan)
-    peer_pool = peer_pool[(peer_pool > 0) & (peer_pool < 80)]
-    peer_median = float(peer_pool.median()) if len(peer_pool) else np.nan
+    # Peer EV/EBITDA median across universe (exclude null, inf, extreme)
+    peer_median_row = (
+        d
+        .with_columns(pl.col("ev_to_ebitda").cast(pl.Float64))
+        .filter(
+            pl.col("ev_to_ebitda").is_not_null()
+            & pl.col("ev_to_ebitda").is_finite()
+            & (pl.col("ev_to_ebitda") > 0)
+            & (pl.col("ev_to_ebitda") < 80)
+        )
+        .select(pl.col("ev_to_ebitda").median().alias("peer_median"))
+    )
 
-    d["peer_ev_to_ebitda_median"] = peer_median
+    peer_median = peer_median_row.item() if peer_median_row.height > 0 else None
 
-    dcf_bear, dcf_base, dcf_bull, peer_fv = [], [], [], []
+    d = d.with_columns(pl.lit(peer_median).cast(pl.Float64).alias("peer_ev_to_ebitda_median"))
 
-    for _, r in d.iterrows():
+    dcf_bear: List[Optional[float]] = []
+    dcf_base: List[Optional[float]] = []
+    dcf_bull: List[Optional[float]] = []
+    peer_fv: List[Optional[float]] = []
+
+    for r in d.iter_rows(named=True):
         fcf = r.get("fcf")
         shares = r.get("shares_out")
         net_debt = r.get("net_debt")
         ebitda = r.get("ebitda")
 
-        # DCF
-        if any(pd.isna(x) for x in [fcf, shares, net_debt]):
-            dcf_bear.append(np.nan); dcf_base.append(np.nan); dcf_bull.append(np.nan)
+        # DCF scenarios
+        if fcf is None or shares is None or net_debt is None:
+            dcf_bear.append(None)
+            dcf_base.append(None)
+            dcf_bull.append(None)
         else:
-            dcf_bear.append(dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_bear))
-            dcf_base.append(dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_base))
-            dcf_bull.append(dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_bull))
+            dcf_bear.append(
+                dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_bear)
+            )
+            dcf_base.append(
+                dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_base)
+            )
+            dcf_bull.append(
+                dcf_lite_equity_value_per_share(float(fcf), float(shares), float(net_debt), dcf_params, dcf_params.growth_bull)
+            )
 
-        # Peer multiple
-        if not pd.isna(peer_median) and not any(pd.isna(x) for x in [ebitda, shares, net_debt]):
-            peer_fv.append(peer_multiple_fair_value_per_share(peer_median, float(ebitda), float(shares), float(net_debt)))
+        # Peer multiple fair value
+        if peer_median is None or ebitda is None or shares is None or net_debt is None:
+            peer_fv.append(None)
         else:
-            peer_fv.append(np.nan)
+            peer_fv.append(
+                peer_multiple_fair_value_per_share(float(peer_median), float(ebitda), float(shares), float(net_debt))
+            )
 
-    d["dcf_bear"] = dcf_bear
-    d["dcf_base"] = dcf_base
-    d["dcf_bull"] = dcf_bull
-    d["peer_fair_value"] = peer_fv
+    d = d.with_columns([
+        pl.Series("dcf_bear", dcf_bear, dtype=pl.Float64),
+        pl.Series("dcf_base", dcf_base, dtype=pl.Float64),
+        pl.Series("dcf_bull", dcf_bull, dtype=pl.Float64),
+        pl.Series("peer_fair_value", peer_fv, dtype=pl.Float64),
+    ])
 
     # Blend intrinsic estimate
-    intrinsic = []
-    for _, r in d.iterrows():
-        a, b = r.get("dcf_base"), r.get("peer_fair_value")
-        if pd.notna(a) and pd.notna(b):
-            intrinsic.append(0.6 * float(a) + 0.4 * float(b))
-        elif pd.notna(a):
-            intrinsic.append(float(a))
-        elif pd.notna(b):
-            intrinsic.append(float(b))
-        else:
-            intrinsic.append(np.nan)
+    d = d.with_columns([
+        pl.when(pl.col("dcf_base").is_not_null() & pl.col("peer_fair_value").is_not_null())
+          .then(0.6 * pl.col("dcf_base") + 0.4 * pl.col("peer_fair_value"))
+          .otherwise(pl.coalesce([pl.col("dcf_base"), pl.col("peer_fair_value")]))
+          .alias("intrinsic_est")
+    ])
 
-    d["intrinsic_est"] = intrinsic
+    mos = float(sig_params.margin_of_safety)
+    buf = float(sig_params.sell_buffer)
 
-    mos = sig_params.margin_of_safety
-    buf = sig_params.sell_buffer
+    d = d.with_columns([
+        (pl.col("intrinsic_est") * (1.0 - mos)).alias("buy_threshold"),
+        (pl.col("intrinsic_est") * (1.0 + buf)).alias("sell_threshold"),
+    ])
 
-    d["buy_threshold"] = d["intrinsic_est"] * (1.0 - mos)
-    d["sell_threshold"] = d["intrinsic_est"] * (1.0 + buf)
+    # Signal generation (fully vectorized)
+    d = d.with_columns([
+        pl.when(pl.col("price").is_null() | pl.col("intrinsic_est").is_null())
+          .then(pl.lit("NO_DATA"))
+          .when(~pl.col("quality_pass"))
+          .then(
+              pl.when(pl.col("price") <= pl.col("buy_threshold"))
+                .then(pl.lit("CHEAP_BUT_FAILS_QUALITY"))
+                .otherwise(pl.lit("FAILS_QUALITY"))
+          )
+          .when(pl.col("price") <= pl.col("buy_threshold"))
+          .then(pl.lit("BUY"))
+          .when(pl.col("price") >= pl.col("sell_threshold"))
+          .then(pl.lit("SELL/TRIM"))
+          .otherwise(pl.lit("HOLD"))
+          .alias("signal")
+    ])
 
-    def signal_row(r) -> str:
-        price = r.get("price")
-        intrinsic_est = r.get("intrinsic_est")
-        if pd.isna(price) or pd.isna(intrinsic_est):
-            return "NO_DATA"
-        if not bool(r.get("quality_pass", False)):
-            if price <= r.get("buy_threshold", -np.inf):
-                return "CHEAP_BUT_FAILS_QUALITY"
-            return "FAILS_QUALITY"
-        if price <= r.get("buy_threshold"):
-            return "BUY"
-        if price >= r.get("sell_threshold"):
-            return "SELL/TRIM"
-        return "HOLD"
-
-    d["signal"] = d.apply(signal_row, axis=1)
-    d["upside_to_intrinsic"] = (d["intrinsic_est"] / d["price"]) - 1.0
+    d = d.with_columns([
+        (pl.col("intrinsic_est") / pl.col("price") - 1.0).alias("upside_to_intrinsic")
+    ])
 
     return d
 
@@ -466,22 +508,13 @@ def main():
     sp500 = fetch_sp500_tickers()
     europe = fetch_stoxx600_from_ishares()
 
-    # Create universe dataframe
-    sp500_universe = sp500.copy()
-    sp500_universe["Country"] = "United States"
-    sp500_universe["Region"] = "US"
-
-    us = sp500_universe[["Ticker", "Security", "Country", "Region", "GICS Sector", "GICS Sub-Industry"]].copy()
-
-    # Europe holdings do not have GICS sub-industry
-    eu = europe.copy()
-    eu["GICS Sub-Industry"] = None
-
-    universe = pd.concat([us, eu], ignore_index=True)
+    # Combine both ticker DFs
+    ticker_cols = ["Ticker", "Security", "Country", "Region", "GICS Sector", "GICS Sub-Industry"]
+    universe = pl.concat([sp500.select(ticker_cols), europe.select(ticker_cols)], how="vertical")
 
     # Get ticker symbols
-    snp500_tickers = sp500["Ticker"].tolist()
-    europe_tickers = europe["Ticker"].tolist()
+    snp500_tickers = sp500["Ticker"].to_list()
+    europe_tickers = europe["Ticker"].to_list()
     if MAX_TICKERS is not None:
         snp500_tickers = snp500_tickers[:MAX_TICKERS]
         europe_tickers = europe_tickers[:MAX_TICKERS]
@@ -493,18 +526,16 @@ def main():
     df = build_universe_snapshot(tickers)
 
     # Merge df with company details
-    df = df.merge(
-        universe[["Ticker", "Security", "GICS Sector", "GICS Sub-Industry", "Country", "Region"]],
-        left_on="ticker",
-        right_on="Ticker",
+    df = df.join(
+        universe.select(["Ticker", "Security", "GICS Sector", "GICS Sub-Industry", "Country", "Region"]).rename({"Ticker": "ticker"}),
+        on="ticker",
         how="left",
-    ).drop(columns=["Ticker"])
+    )
 
     df = apply_quality_screen(df)
 
     # Calculate intrinsic value and generate signals based on dcf and signal hyperparameters
     df = compute_intrinsic_and_signals(df, dcf_params, sig_params)
-    df[["ticker","price","intrinsic_est","upside_to_intrinsic","signal","quality_pass"]].sort_values("upside_to_intrinsic", ascending=False).head(20)
 
     # Export data
     watchlist_cols = [
@@ -517,14 +548,10 @@ def main():
         "fcf", "ebitda", "net_debt", "shares_out",
     ]
 
-    watchlist = df[watchlist_cols].copy()
-
-    # add readability columns
-    watchlist["fcf_bil"] = watchlist["fcf"].apply(to_billions)
-    watchlist["ebitda_bil"] = watchlist["ebitda"].apply(to_billions)
+    watchlist = df.select(watchlist_cols)
 
     out_file = OUT_PATH or f"sp500eu600_value_watchlist_{datetime.datetime.now().strftime('%Y-%m-%d_%H%M')}.csv"
-    watchlist.to_csv(out_file, index=False)
+    watchlist.write_csv(out_file)
     print(f"Saved watchlist to: {out_file}")
 
 if __name__ == '__main__':
